@@ -1,96 +1,97 @@
 using System;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Systems_One_MQTT_Service.Services;
 
 namespace Systems_One_MQTT_Service
 {
     /// <summary>
-    /// Background worker that periodically sends MQTT messages with dynamic payloads.
+    /// Background worker that queries database every 15 minutes and sends summary statistics to MQTT broker.
     /// </summary>
     public class Worker : BackgroundService
     {
         private readonly ILogger<Worker> _logger;
         private readonly MqttService _mqttService;
-        private int _messageCount;
-        private static readonly Random Random = new();
+        private readonly DataService _dataService;
+        private static readonly TimeSpan IntervalDuration = TimeSpan.FromMinutes(15);
 
-        public Worker(ILogger<Worker> logger, MqttService mqttService)
+        public Worker(ILogger<Worker> logger, MqttService mqttService, DataService dataService)
         {
             _logger = logger;
             _mqttService = mqttService;
+            _dataService = dataService;
         }
 
         /// <inheritdoc />
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            await Task.Delay(5000, stoppingToken); // Allow initial connection test
+            _logger.LogInformation("Worker started - will send statistics every {Interval} minutes", IntervalDuration.TotalMinutes);
+            
+            // Wait a bit for the initial connection test to complete
+            await Task.Delay(5000, stoppingToken);
 
             while (!stoppingToken.IsCancellationRequested)
             {
                 try
                 {
-                    _logger.LogInformation("Worker running at: {time}", DateTimeOffset.Now);
-
-                    // Every 30 seconds, send an MQTT message
-                    if (_messageCount % 30 == 0)
-                    {
-                        _logger.LogInformation("Worker sending periodic MQTT message");
-                        await SendPeriodicUpdateAsync(stoppingToken);
-                    }
-
-                    _messageCount++;
-                    await Task.Delay(1000, stoppingToken);
+                    _logger.LogInformation("Worker executing at: {time} - querying last 15 minutes of data", DateTimeOffset.Now);
+                    
+                    // Send 15-minute summary statistics
+                    await SendLast15MinutesStatisticsAsync(stoppingToken);
+                    
+                    // Wait for 15 minutes before next execution
+                    _logger.LogInformation("Next statistics update in {Minutes} minutes at {NextTime}", 
+                        IntervalDuration.TotalMinutes, 
+                        DateTime.Now.Add(IntervalDuration).ToString("yyyy-MM-dd HH:mm:ss"));
+                    
+                    await Task.Delay(IntervalDuration, stoppingToken);
                 }
                 catch (Exception ex) when (ex is not TaskCanceledException)
                 {
                     _logger.LogError(ex, "Error in worker execution");
-                    await Task.Delay(5000, stoppingToken);
+                    // Wait 5 minutes before retrying on error
+                    await Task.Delay(TimeSpan.FromMinutes(5), stoppingToken);
                 }
             }
         }
 
-        private async Task SendPeriodicUpdateAsync(CancellationToken cancellationToken)
+        private async Task SendLast15MinutesStatisticsAsync(CancellationToken cancellationToken)
         {
             try
             {
-                var payload = CreateDynamicPayload();
+                // Get statistics from the database for the last 15 minutes
+                var dbStats = await _dataService.GetLast15MinutesStatisticsAsync();
+                
+                // Convert database statistics to MQTT payload format
+                var payload = CreateStatisticsPayload(dbStats);
+                
+                // Send the statistics via MQTT
                 await _mqttService.SendCustomMessageAsync(payload, cancellationToken);
+                
+                _logger.LogInformation("Successfully sent 15-minute statistics to MQTT broker");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to send periodic MQTT message");
+                _logger.LogError(ex, "Failed to send 15-minute statistics");
+                throw;
             }
         }
 
-        private static object CreateDynamicPayload()
+        private static object CreateStatisticsPayload(dynamic dbStats)
         {
-            var totalItems = 260 + Random.Next(0, 20);
-            var noWeight = Random.Next(2, 8);
-            var outOfSpec = Random.Next(0, 3);
-            var noDimensions = Random.Next(0, 3);
-            var notSent = Random.Next(0, 2);
-            var greaterThanOneItem = Random.Next(8, 15);
-
-            var success = totalItems - noWeight - outOfSpec - noDimensions;
-            var sent = success;
-
+            // Convert database statistics to the expected MQTT format
             var statistics = new[]
             {
-                new { SensorId = "TotalItems", Value = (double)totalItems, Unit = "count" },
-                new { SensorId = "NoWeight", Value = (double)noWeight, Unit = "count" },
-                new { SensorId = "Success", Value = (double)success, Unit = "count" },
-                new { SensorId = "NoDimensions", Value = (double)noDimensions, Unit = "count" },
-                new { SensorId = "OutOfSpec", Value = (double)outOfSpec, Unit = "count" },
-                new { SensorId = "NotSent", Value = (double)notSent, Unit = "count" },
-                new { SensorId = "Sent", Value = (double)sent, Unit = "count" },
-                new { SensorId = "GreaterThanOneItem", Value = (double)greaterThanOneItem, Unit = "count" }
-            };
-
-            var readings = new[]
-            {
-                new { SensorId = "temp-1", Value = Math.Round(22.0 + Random.NextDouble() * 3.0, 1), Unit = "Celsius" },
-                new { SensorId = "humidity-1", Value = Math.Round(40.0 + Random.NextDouble() * 10.0, 1), Unit = "%" },
-                new { SensorId = "pressure-1", Value = Math.Round(1010.0 + Random.NextDouble() * 10.0, 1), Unit = "hPa" }
+                new { SensorId = "TotalItems", Value = (double)dbStats.TotalItems, Unit = "count" },
+                new { SensorId = "NoWeight", Value = (double)dbStats.NoWeight, Unit = "count" },
+                new { SensorId = "Success", Value = (double)dbStats.Success, Unit = "count" },
+                new { SensorId = "NoDimensions", Value = (double)dbStats.NoDimensions, Unit = "count" },
+                new { SensorId = "OutOfSpec", Value = (double)dbStats.OutOfSpec, Unit = "count" },
+                new { SensorId = "NotSent", Value = (double)dbStats.NotSent, Unit = "count" },
+                new { SensorId = "Sent", Value = (double)dbStats.Sent, Unit = "count" },
+                new { SensorId = "Complete", Value = (double)dbStats.Complete, Unit = "count" },
+                new { SensorId = "Valid", Value = (double)dbStats.Valid, Unit = "count" },
+                new { SensorId = "ImageSent", Value = (double)dbStats.ImageSent, Unit = "count" }
             };
 
             var epochTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -99,9 +100,16 @@ namespace Systems_One_MQTT_Service
             {
                 DeviceId = "device-001",
                 Timestamp = epochTime,
-                Readings = readings,
+                TimeRange = new
+                {
+                    StartTime = dbStats.TimeRange.StartTime,
+                    EndTime = dbStats.TimeRange.EndTime,
+                    DurationMinutes = 15
+                },
                 Status = "operational",
-                Statistics = statistics
+                Statistics = statistics,
+                DataSource = "database_query",
+                QueryType = "last_15_minutes"
             };
         }
     }
