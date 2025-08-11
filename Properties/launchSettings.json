@@ -5,6 +5,13 @@
       "commandName": "Project",
       "dotnetRunMessages": true,
       "environmentVariables": {
+        "DOTNET_ENVIRONMENT": "Production"
+      }
+    },
+    "Systems_One_MQTT_Service_Dev": {
+      "commandName": "Project",
+      "dotnetRunMessages": true,
+      "environmentVariables": {
         "DOTNET_ENVIRONMENT": "Development"
       }
     }

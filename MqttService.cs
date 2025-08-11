@@ -5,6 +5,9 @@ using MQTTnet;
 using MQTTnet.Client;
 using MQTTnet.Protocol;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Options;
+using Systems_One_MQTT_Service.Models;
 
 namespace Systems_One_MQTT_Service
 {
@@ -16,54 +19,134 @@ namespace Systems_One_MQTT_Service
         private readonly ILogger<MqttService> _logger;
         private readonly IMqttClient _mqttClient;
         private readonly MqttClientOptions _mqttClientOptions;
+        private readonly MqttConfiguration _mqttConfig;
         private bool _disposed;
-        private readonly string _brokerHost = "mqtt.bantryprop.com";
-        private readonly string _brokerPath = "/ws";
-        private readonly string _username = "Admin";
-        private readonly string _password = "Admin";
-        private readonly string _topic;
-        private readonly string _willTopic;
+        private readonly string _dataTopic;
+        private readonly string _statusTopic;
         private readonly string _clientName;
         private readonly string _location;
         private readonly string _station;
+        private readonly string _deviceSerialNumber;
+        private int _reconnectAttempts = 0;
 
-        public MqttService(ILogger<MqttService> logger, string clientName, string location, string station)
+        public MqttService(ILogger<MqttService> logger, IConfiguration configuration, string clientName, string location, string station)
         {
             _logger = logger;
             _clientName = clientName;
             _location = location;
             _station = station;
-            _topic = $"systems-one/{clientName}/{location}/{station}";
-            _willTopic = $"systems-one/{clientName}/{location}/{station}/status";
+            
+            // Get device serial number from configuration
+            _deviceSerialNumber = configuration["Device:SerialNumber"] ?? $"{station}-001";
+            
+            // Load MQTT configuration
+            _mqttConfig = new MqttConfiguration();
+            configuration.GetSection("MQTT").Bind(_mqttConfig);
+            
+            // Build topic structure - separate data and status topics
+            _dataTopic = $"{_mqttConfig.Topics.BaseTopic}/{clientName}/{location}/{station}/{_mqttConfig.Topics.DataSuffix}";
+            _statusTopic = $"{_mqttConfig.Topics.BaseTopic}/{clientName}/{location}/{station}/{_mqttConfig.Topics.StatusSuffix}";
+            
             var mqttFactory = new MqttFactory();
             _mqttClient = mqttFactory.CreateMqttClient();
-            var lastWillPayload = new
-            {
-                DeviceId = $"{station}-001",
-                Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                Status = "offline",
-                Message = $"Device {station} at {location} has gone offline unexpectedly"
-            };
-            var lastWillJson = JsonSerializer.Serialize(lastWillPayload);
-            _mqttClientOptions = new MqttClientOptionsBuilder()
-                .WithWebSocketServer(options => { options.Uri = $"wss://{_brokerHost}{_brokerPath}"; })
-                .WithClientId($"SystemsOneMqttClient_{Guid.NewGuid()}")
-                .WithCredentials(_username, _password)
-                .WithCleanSession()
-                .WithTls()
-                .WithWillTopic(_willTopic)
-                .WithWillPayload(Encoding.UTF8.GetBytes(lastWillJson))
-                .WithWillQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
-                .WithWillRetain(true)
-                .Build();
+            
+            // Build MQTT client options from configuration
+            _mqttClientOptions = BuildMqttClientOptions();
+            
             _mqttClient.DisconnectedAsync += HandleDisconnectedAsync;
+            
+            _logger.LogInformation("MQTT Service initialized with Device Serial Number: {SerialNumber}", _deviceSerialNumber);
+            _logger.LogInformation("Data Topic: {DataTopic}, Status Topic: {StatusTopic}", _dataTopic, _statusTopic);
+        }
+
+        private MqttClientOptions BuildMqttClientOptions()
+        {
+            var optionsBuilder = new MqttClientOptionsBuilder()
+                .WithClientId($"{_mqttConfig.Client.ClientIdPrefix}_{Guid.NewGuid()}")
+                .WithCredentials(_mqttConfig.Authentication.Username, _mqttConfig.Authentication.Password)
+                .WithKeepAlivePeriod(TimeSpan.FromSeconds(_mqttConfig.Broker.KeepAlive))
+                .WithTimeout(TimeSpan.FromMilliseconds(_mqttConfig.Broker.ConnectionTimeout));
+
+            if (_mqttConfig.Client.CleanSession)
+            {
+                optionsBuilder.WithCleanSession();
+            }
+
+            // Configure connection type (WebSocket vs TCP)
+            if (_mqttConfig.Broker.UseWebSockets)
+            {
+                var protocol = _mqttConfig.Broker.UseTLS ? "wss" : "ws";
+                var uri = $"{protocol}://{_mqttConfig.Broker.Host}:{_mqttConfig.Broker.Port}{_mqttConfig.Broker.Path}";
+                optionsBuilder.WithWebSocketServer(options => { options.Uri = uri; });
+            }
+            else
+            {
+                optionsBuilder.WithTcpServer(_mqttConfig.Broker.Host, _mqttConfig.Broker.Port);
+            }
+
+            if (_mqttConfig.Broker.UseTLS)
+            {
+                optionsBuilder.WithTls();
+            }
+
+            // Configure Last Will Testament if enabled
+            if (_mqttConfig.LastWill.Enabled)
+            {
+                var lastWillPayload = new
+                {
+                    DeviceId = _deviceSerialNumber,
+                    Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    Status = "offline"
+                };
+                var lastWillJson = JsonSerializer.Serialize(lastWillPayload);
+                
+                optionsBuilder
+                    .WithWillTopic(_statusTopic)
+                    .WithWillPayload(Encoding.UTF8.GetBytes(lastWillJson))
+                    .WithWillQualityOfServiceLevel(ParseQualityOfService(_mqttConfig.LastWill.QualityOfService))
+                    .WithWillRetain(_mqttConfig.LastWill.Retain);
+                    
+                _logger.LogInformation("Last Will Testament configured: {LastWillPayload}", lastWillJson);
+            }
+
+            return optionsBuilder.Build();
+        }
+
+        private MqttQualityOfServiceLevel ParseQualityOfService(string qosString)
+        {
+            return qosString?.ToLower() switch
+            {
+                "atmostonce" => MqttQualityOfServiceLevel.AtMostOnce,
+                "atleastonce" => MqttQualityOfServiceLevel.AtLeastOnce,
+                "exactlyonce" => MqttQualityOfServiceLevel.ExactlyOnce,
+                _ => MqttQualityOfServiceLevel.AtLeastOnce
+            };
         }
 
         private async Task HandleDisconnectedAsync(MqttClientDisconnectedEventArgs args)
         {
             _logger.LogWarning("Disconnected from MQTT broker: {Reason}", args.Reason);
-            await Task.Delay(TimeSpan.FromSeconds(5));
-            try { await ConnectAsync(); } catch (Exception ex) { _logger.LogError(ex, "Failed to reconnect to MQTT broker"); }
+            
+            if (_reconnectAttempts < _mqttConfig.Client.MaxReconnectAttempts)
+            {
+                _reconnectAttempts++;
+                _logger.LogInformation("Attempting reconnection {Attempt}/{MaxAttempts}", _reconnectAttempts, _mqttConfig.Client.MaxReconnectAttempts);
+                
+                await Task.Delay(_mqttConfig.Client.ReconnectDelay);
+                try 
+                { 
+                    await ConnectAsync(); 
+                    _reconnectAttempts = 0; // Reset on successful connection
+                } 
+                catch (Exception ex) 
+                { 
+                    _logger.LogError(ex, "Failed to reconnect to MQTT broker (attempt {Attempt})", _reconnectAttempts); 
+                }
+            }
+            else
+            {
+                _logger.LogError("Maximum reconnection attempts ({MaxAttempts}) reached. Giving up.", _mqttConfig.Client.MaxReconnectAttempts);
+            }
         }
 
         private async Task ConnectAsync(CancellationToken cancellationToken = default)
@@ -71,7 +154,11 @@ namespace Systems_One_MQTT_Service
             if (_mqttClient.IsConnected) return;
             try
             {
-                _logger.LogInformation("Connecting to MQTT broker at wss://{Host}{Path}...", _brokerHost, _brokerPath);
+                var connectionUri = _mqttConfig.Broker.UseWebSockets 
+                    ? $"{(_mqttConfig.Broker.UseTLS ? "wss" : "ws")}://{_mqttConfig.Broker.Host}:{_mqttConfig.Broker.Port}{_mqttConfig.Broker.Path}"
+                    : $"{_mqttConfig.Broker.Host}:{_mqttConfig.Broker.Port}";
+                    
+                _logger.LogInformation("Connecting to MQTT broker at {Uri}...", connectionUri);
                 var result = await _mqttClient.ConnectAsync(_mqttClientOptions, cancellationToken);
                 if (result.ResultCode == MqttClientConnectResultCode.Success)
                 {
@@ -96,20 +183,19 @@ namespace Systems_One_MQTT_Service
             {
                 var statusPayload = new
                 {
-                    DeviceId = $"{_station}-001",
+                    DeviceId = _deviceSerialNumber,
                     Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                    Status = status,
-                    Message = $"Device {_station} at {_location} is {status}"
+                    Status = status
                 };
                 var statusJson = JsonSerializer.Serialize(statusPayload);
                 var message = new MqttApplicationMessageBuilder()
-                    .WithTopic(_willTopic)
+                    .WithTopic(_statusTopic)
                     .WithPayload(Encoding.UTF8.GetBytes(statusJson))
-                    .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
-                    .WithRetainFlag(true)
+                    .WithQualityOfServiceLevel(ParseQualityOfService(_mqttConfig.Publishing.QualityOfService))
+                    .WithRetainFlag(_mqttConfig.Publishing.RetainStatusMessages)
                     .Build();
                 await _mqttClient.PublishAsync(message, cancellationToken);
-                _logger.LogInformation("Published status message: {Status}", status);
+                _logger.LogInformation("Published status message: {Status} for device {DeviceId} to topic {Topic}", status, _deviceSerialNumber, _statusTopic);
             }
             catch (Exception ex)
             {
@@ -127,26 +213,26 @@ namespace Systems_One_MQTT_Service
                 _logger.LogInformation("Starting MQTT connection test");
                 var sampleData = new
                 {
-                    DeviceId = "device-001",
+                    DeviceId = _deviceSerialNumber,
                     Timestamp = GetEpochTimeMs(),
                     Statistics = GenerateStatsReadings()
                 };
                 var jsonPayload = JsonSerializer.Serialize(sampleData, new JsonSerializerOptions { WriteIndented = true });
                 byte[] payloadBytes = Encoding.UTF8.GetBytes(jsonPayload);
                 _logger.LogInformation("Sample JSON message: {payload}", jsonPayload);
-                _logger.LogInformation("Connection details - Host: {Host}, Path: {Path}, Username: {Username}", _brokerHost, _brokerPath, _username);
-                _logger.LogInformation("Publishing to topic: {Topic}", _topic);
-                _logger.LogInformation("Last Will configured for topic: {WillTopic}", _willTopic);
+                _logger.LogInformation("Connection details - Host: {Host}, Username: {Username}", _mqttConfig.Broker.Host, _mqttConfig.Authentication.Username);
+                _logger.LogInformation("Publishing to data topic: {DataTopic}", _dataTopic);
+                _logger.LogInformation("Last Will configured for status topic: {StatusTopic}", _statusTopic);
                 await ConnectAsync();
                 if (_mqttClient.IsConnected)
                 {
                     var applicationMessage = new MqttApplicationMessageBuilder()
-                        .WithTopic(_topic)
+                        .WithTopic(_dataTopic)
                         .WithPayload(payloadBytes)
-                        .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
-                        .WithRetainFlag(false)
+                        .WithQualityOfServiceLevel(ParseQualityOfService(_mqttConfig.Publishing.QualityOfService))
+                        .WithRetainFlag(_mqttConfig.Publishing.RetainMessages)
                         .Build();
-                    _logger.LogInformation("Publishing message to topic {Topic}", _topic);
+                    _logger.LogInformation("Publishing message to data topic {DataTopic}", _dataTopic);
                     await _mqttClient.PublishAsync(applicationMessage);
                     _logger.LogInformation("Message published successfully");
                 }
@@ -178,13 +264,13 @@ namespace Systems_One_MQTT_Service
                     var jsonPayload = JsonSerializer.Serialize(customPayload, new JsonSerializerOptions { WriteIndented = true });
                     byte[] payloadBytes = Encoding.UTF8.GetBytes(jsonPayload);
                     var applicationMessage = new MqttApplicationMessageBuilder()
-                        .WithTopic(_topic)
+                        .WithTopic(_dataTopic)
                         .WithPayload(payloadBytes)
-                        .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
-                        .WithRetainFlag(false)
+                        .WithQualityOfServiceLevel(ParseQualityOfService(_mqttConfig.Publishing.QualityOfService))
+                        .WithRetainFlag(_mqttConfig.Publishing.RetainMessages)
                         .Build();
                     await _mqttClient.PublishAsync(applicationMessage, cancellationToken);
-                    _logger.LogInformation("Custom message published successfully");
+                    _logger.LogInformation("Custom message published successfully to data topic {DataTopic}", _dataTopic);
                 }
             }
             catch (Exception ex)
@@ -231,6 +317,7 @@ namespace Systems_One_MQTT_Service
         // Generate statistics data using the Readings format (SensorId, Value, Unit)
         private object[] GenerateStatsReadings() => new[]
         {
+            // Database statistics
             new { SensorId = "TotalItems", Value = 264.0, Unit = "count" },
             new { SensorId = "NoWeight", Value = 4.0, Unit = "count" },
             new { SensorId = "Success", Value = 249.0, Unit = "count" },
@@ -238,7 +325,17 @@ namespace Systems_One_MQTT_Service
             new { SensorId = "OutOfSpec", Value = 1.0, Unit = "count" },
             new { SensorId = "NotSent", Value = 0.0, Unit = "count" },
             new { SensorId = "Sent", Value = 249.0, Unit = "count" },
-            new { SensorId = "GreaterThanOneItem", Value = 10.0, Unit = "count" }
+            new { SensorId = "GreaterThanOneItem", Value = 10.0, Unit = "count" },
+            
+            // System monitoring sample data
+            new { SensorId = "Drive_C_UsedPercentage", Value = 65.5, Unit = "percent" },
+            new { SensorId = "Drive_C_FreeSpaceGB", Value = 156.8, Unit = "GB" },
+            new { SensorId = "Drive_C_TotalSpaceGB", Value = 454.2, Unit = "GB" },
+            new { SensorId = "Drive_D_UsedPercentage", Value = 12.3, Unit = "percent" },
+            new { SensorId = "Drive_D_FreeSpaceGB", Value = 850.1, Unit = "GB" },
+            new { SensorId = "Drive_D_TotalSpaceGB", Value = 969.7, Unit = "GB" },
+            new { SensorId = "Memory_WorkingSetMB", Value = 125.6, Unit = "MB" },
+            new { SensorId = "Memory_ManagedMemoryMB", Value = 45.2, Unit = "MB" }
         };
 
         // Get the current epoch time in milliseconds

@@ -1,31 +1,53 @@
 using System;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Configuration;
 using Systems_One_MQTT_Service.Services;
+using System.Globalization;
 
 namespace Systems_One_MQTT_Service
 {
     /// <summary>
-    /// Background worker that queries database every 15 minutes and sends summary statistics to MQTT broker.
+    /// Background worker that queries database and sends summary statistics to MQTT broker at configurable intervals.
     /// </summary>
     public class Worker : BackgroundService
     {
         private readonly ILogger<Worker> _logger;
         private readonly MqttService _mqttService;
         private readonly DataService _dataService;
-        private static readonly TimeSpan IntervalDuration = TimeSpan.FromMinutes(15);
+        private readonly SystemMonitoringService _systemMonitoringService;
+        private readonly IConfiguration _configuration;
+        private readonly TimeSpan _intervalDuration;
+        private readonly string _deviceSerialNumber;
 
-        public Worker(ILogger<Worker> logger, MqttService mqttService, DataService dataService)
+        public Worker(ILogger<Worker> logger, MqttService mqttService, DataService dataService, SystemMonitoringService systemMonitoringService, IConfiguration configuration)
         {
             _logger = logger;
             _mqttService = mqttService;
             _dataService = dataService;
+            _systemMonitoringService = systemMonitoringService;
+            _configuration = configuration;
+            
+            // Get device serial number from configuration
+            _deviceSerialNumber = configuration["Device:SerialNumber"] ?? "UNKNOWN-DEVICE-001";
+            
+            // Get publish interval from configuration (default to 15 minutes) with safe parsing
+            var publishIntervalString = configuration["MQTT:Publishing:PublishInterval"] ?? "15";
+            if (!int.TryParse(publishIntervalString, NumberStyles.Integer, CultureInfo.InvariantCulture, out var publishIntervalMinutes))
+            {
+                _logger.LogWarning("Invalid PublishInterval value '{Value}', using default 15 minutes", publishIntervalString);
+                publishIntervalMinutes = 15;
+            }
+            
+            _intervalDuration = TimeSpan.FromMinutes(publishIntervalMinutes);
+            _logger.LogInformation("Worker configured with {Minutes} minute publish interval", publishIntervalMinutes);
+            _logger.LogInformation("Device Serial Number: {SerialNumber}", _deviceSerialNumber);
         }
 
         /// <inheritdoc />
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _logger.LogInformation("Worker started - will send statistics every {Interval} minutes", IntervalDuration.TotalMinutes);
+            _logger.LogInformation("Worker started - will send statistics every {Interval} minutes", _intervalDuration.TotalMinutes);
             
             // Wait a bit for the initial connection test to complete
             await Task.Delay(5000, stoppingToken);
@@ -34,17 +56,18 @@ namespace Systems_One_MQTT_Service
             {
                 try
                 {
-                    _logger.LogInformation("Worker executing at: {time} - querying last 15 minutes of data", DateTimeOffset.Now);
+                    _logger.LogInformation("Worker executing at: {time} - querying last {Minutes} minutes of data and system health", 
+                        DateTimeOffset.Now, _intervalDuration.TotalMinutes);
                     
-                    // Send 15-minute summary statistics
-                    await SendLast15MinutesStatisticsAsync(stoppingToken);
+                    // Send statistics including system health
+                    await SendStatisticsAsync(stoppingToken);
                     
-                    // Wait for 15 minutes before next execution
+                    // Wait for configured interval before next execution
                     _logger.LogInformation("Next statistics update in {Minutes} minutes at {NextTime}", 
-                        IntervalDuration.TotalMinutes, 
-                        DateTime.Now.Add(IntervalDuration).ToString("yyyy-MM-dd HH:mm:ss"));
+                        _intervalDuration.TotalMinutes, 
+                        DateTime.Now.Add(_intervalDuration).ToString("yyyy-MM-dd HH:mm:ss"));
                     
-                    await Task.Delay(IntervalDuration, stoppingToken);
+                    await Task.Delay(_intervalDuration, stoppingToken);
                 }
                 catch (Exception ex) when (ex is not TaskCanceledException)
                 {
@@ -55,32 +78,37 @@ namespace Systems_One_MQTT_Service
             }
         }
 
-        private async Task SendLast15MinutesStatisticsAsync(CancellationToken cancellationToken)
+        private async Task SendStatisticsAsync(CancellationToken cancellationToken)
         {
             try
             {
-                // Get statistics from the database for the last 15 minutes
+                // Get statistics from the database for the last interval period
                 var dbStats = await _dataService.GetLast15MinutesStatisticsAsync();
                 
-                // Convert database statistics to MQTT payload format
-                var payload = CreateStatisticsPayload(dbStats);
+                // Get system health statistics
+                var systemHealth = await _systemMonitoringService.GetSystemHealthStatisticsAsync();
+                var driveStats = await _systemMonitoringService.GetDriveStatisticsAsync();
+                
+                // Convert database and system statistics to MQTT payload format
+                var payload = CreateEnhancedStatisticsPayload(dbStats, systemHealth, driveStats);
                 
                 // Send the statistics via MQTT
                 await _mqttService.SendCustomMessageAsync(payload, cancellationToken);
                 
-                _logger.LogInformation("Successfully sent 15-minute statistics to MQTT broker");
+                _logger.LogInformation("Successfully sent {Minutes}-minute statistics with system health to MQTT broker", 
+                    _intervalDuration.TotalMinutes);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to send 15-minute statistics");
+                _logger.LogError(ex, "Failed to send statistics");
                 throw;
             }
         }
 
-        private static object CreateStatisticsPayload(dynamic dbStats)
+        private object CreateEnhancedStatisticsPayload(dynamic dbStats, dynamic systemHealth, IEnumerable<Models.DriveStatistics> driveStats)
         {
             // Convert database statistics to the expected MQTT format
-            var statistics = new[]
+            var databaseStatistics = new[]
             {
                 new { SensorId = "TotalItems", Value = (double)dbStats.TotalItems, Unit = "count" },
                 new { SensorId = "NoWeight", Value = (double)dbStats.NoWeight, Unit = "count" },
@@ -94,22 +122,18 @@ namespace Systems_One_MQTT_Service
                 new { SensorId = "ImageSent", Value = (double)dbStats.ImageSent, Unit = "count" }
             };
 
+            // Create drive sensor readings for Storage section
+            var storageReadings = _systemMonitoringService.CreateDriveSensorReadings(driveStats);
+
             var epochTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
             return new
             {
-                DeviceId = "device-001",
+                DeviceId = _deviceSerialNumber,
+                OSVersion = systemHealth.OSVersion,
                 Timestamp = epochTime,
-                TimeRange = new
-                {
-                    StartTime = dbStats.TimeRange.StartTime,
-                    EndTime = dbStats.TimeRange.EndTime,
-                    DurationMinutes = 15
-                },
-                Status = "operational",
-                Statistics = statistics,
-                DataSource = "database_query",
-                QueryType = "last_15_minutes"
+                Statistics = databaseStatistics,
+                Storage = storageReadings
             };
         }
     }
