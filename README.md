@@ -91,6 +91,8 @@ A comprehensive .NET 8 Worker Service that monitors ItemLog database statistics 
     "Topics": {
       "BaseTopic": "systems-one",
       "StatusSuffix": "status",
+      "StatisticsSuffix": "statistics",
+      "StorageSuffix": "storage",
       "DataSuffix": "data"
     },
     "Publishing": {
@@ -158,92 +160,125 @@ A comprehensive .NET 8 Worker Service that monitors ItemLog database statistics 
 | `AtLeastOnce` | Guaranteed delivery | Important metrics |
 | `ExactlyOnce` | Exactly once delivery | Critical commands |
 
-## ?? MQTT Payload Structure
+## ?? MQTT Payload Structure - Telegraf Optimized
 
-### Current Payload Format (v2.0)
-The service publishes structured data with separate sections for different metric types:
+### Current Payload Format (v3.0) - Telegraf-Friendly
+The service now publishes data in separate, optimized streams for Telegraf ingestion:
 
+#### 1. Status Messages
+**Topic:** `systems-one/PEPKOR/JBH/DIM2/status`
 ```json
 {
-  "DeviceId": "00001",
-  "OSVersion": "Microsoft Windows NT 10.0.26100.0",
-  "Timestamp": 1754907441917,
-  "Statistics": [
-    {
-      "SensorId": "TotalItems",
-      "Value": 264,
-      "Unit": "count"
-    },
-    {
-      "SensorId": "Success",
-      "Value": 249,
-      "Unit": "count"
-    },
-    {
-      "SensorId": "OutOfSpec",
-      "Value": 1,
-      "Unit": "count"
-    }
-  ],
-  "Storage": [
-    {
-      "SensorId": "Drive_C_UsedPercentage",
-      "Value": 59.64,
-      "Unit": "percent"
-    },
-    {
-      "SensorId": "Drive_C_FreeSpaceGB",
-      "Value": 192.07,
-      "Unit": "GB"
-    },
-    {
-      "SensorId": "Drive_C_TotalSpaceGB",
-      "Value": 475.91,
-      "Unit": "GB"
-    }
-  ]
+  "device_id": "00001",
+  "ts": 1754916806909,
+  "status": "online",
+  "os_version": "Microsoft Windows NT 10.0.26100.0"
 }
 ```
 
-### Last Will Testament Format
+#### 2. Statistics Messages 
+**Topic:** `systems-one/PEPKOR/JBH/DIM2/statistics`
 ```json
 {
-  "DeviceId": "00001",
-  "Timestamp": 1754908626380,
-  "Status": "offline"
+  "device_id": "00001",
+  "ts": 1754919514677,
+  "statistics": {
+    "total_items": 7,
+    "no_weight": 1,
+    "success": 6,
+    "no_dimensions": 1,
+    "out_of_spec": 1,
+    "not_sent": 1,
+    "sent": 6,
+    "complete": 6,
+    "valid": 6,
+    "image_sent": 0
+  }
 }
 ```
 
-### Status Message Format
+#### 3. Storage Messages
+**Topic:** `systems-one/PEPKOR/JBH/DIM2/storage`
 ```json
 {
-  "DeviceId": "00001",
-  "Timestamp": 1754908626380,
-  "Status": "online"
+  "device_id": "00001",
+  "ts": 1754919514677,
+  "storage": {
+    "C": {
+      "free_gb": 191.92,
+      "used_gb": 284.07,
+      "total_gb": 475.91,
+      "used_pct": 59.67
+    },
+    "E": {
+      "free_gb": 14.7,
+      "used_gb": 0.14,
+      "total_gb": 14.84,
+      "used_pct": 0.97
+    }
+  }
 }
+```
+
+### Telegraf Integration Benefits
+
+? **Snake_case naming** for easy field mapping  
+? **Timestamp in milliseconds** (`ts`) for precise time alignment  
+? **Numeric values** for metrics (no string conversion needed)  
+? **Hierarchical structure** for easy json_v2 parsing  
+? **Drive letters as keys** for automatic tagging  
+? **Separate topics** for different metric types  
+
+### Topic Structure
+- **Status Channel**: `systems-one/PEPKOR/JBH/DIM2/status`
+- **Statistics Channel**: `systems-one/PEPKOR/JBH/DIM2/statistics`
+- **Storage Channel**: `systems-one/PEPKOR/JBH/DIM2/storage`
+
+### Telegraf Configuration Example
+```toml
+[[inputs.mqtt_consumer]]
+  servers = ["tcp://mqtt.bantryprop.com:1883"]
+  topics = ["systems-one/+/+/+/status", "systems-one/+/+/+/statistics", "systems-one/+/+/+/storage"]
+  data_format = "json_v2"
+  
+  [[inputs.mqtt_consumer.json_v2]]
+    measurement_name = "device_status"
+    timestamp_key = "ts"
+    timestamp_format = "unix_ms"
+    
+    [[inputs.mqtt_consumer.json_v2.tag]]
+      path = "device_id"
+      
+    [[inputs.mqtt_consumer.json_v2.field]]
+      path = "status"
+      type = "string"
+      
+    [[inputs.mqtt_consumer.json_v2.field]]
+      path = "os_version"
+      type = "string"
 ```
 
 ### Database Statistics Metrics
-| Metric | Description |
-|--------|-------------|
-| `TotalItems` | Total items processed in interval |
-| `NoWeight` | Items missing weight data |
-| `Success` | Successfully processed items |
-| `NoDimensions` | Items missing dimension data |
-| `OutOfSpec` | Items outside specifications |
-| `NotSent` | Items not transmitted |
-| `Sent` | Successfully transmitted items |
-| `Complete` | Fully processed items |
-| `Valid` | Items passing validation |
-| `ImageSent` | Items with transmitted images |
+| Field | Description | Type |
+|-------|-------------|------|
+| `total_items` | Total items processed in interval | integer |
+| `no_weight` | Items missing weight data | integer |
+| `success` | Successfully processed items | integer |
+| `no_dimensions` | Items missing dimension data | integer |
+| `out_of_spec` | Items outside specifications | integer |
+| `not_sent` | Items not transmitted | integer |
+| `sent` | Successfully transmitted items | integer |
+| `complete` | Fully processed items | integer |
+| `valid` | Items passing validation | integer |
+| `image_sent` | Items with transmitted images | integer |
 
 ### Storage Metrics (Per Drive)
-| Metric Pattern | Description |
-|----------------|-------------|
-| `Drive_{X}_UsedPercentage` | Percentage of drive space used |
-| `Drive_{X}_FreeSpaceGB` | Available free space in GB |
-| `Drive_{X}_UsedSpaceGB` | Used space in GB |
-| `Drive_{X}_TotalSpaceGB` | Total drive capacity in GB |
+| Field Pattern | Description | Type |
+|---------------|-------------|------|
+| `{drive}.free_gb` | Available free space in GB | float |
+| `{drive}.used_gb` | Used space in GB | float |
+| `{drive}.total_gb` | Total drive capacity in GB | float |
+| `{drive}.used_pct` | Percentage of drive space used | float |
 
 ## ??? Architecture
 

@@ -89,13 +89,10 @@ namespace Systems_One_MQTT_Service
                 var systemHealth = await _systemMonitoringService.GetSystemHealthStatisticsAsync();
                 var driveStats = await _systemMonitoringService.GetDriveStatisticsAsync();
                 
-                // Convert database and system statistics to MQTT payload format
-                var payload = CreateEnhancedStatisticsPayload(dbStats, systemHealth, driveStats);
+                // Send the statistics and storage data via separate MQTT topics
+                await _mqttService.SendStatisticsDataAsync(dbStats, driveStats, cancellationToken);
                 
-                // Send the statistics via MQTT
-                await _mqttService.SendCustomMessageAsync(payload, cancellationToken);
-                
-                _logger.LogInformation("Successfully sent {Minutes}-minute statistics with system health to MQTT broker", 
+                _logger.LogInformation("Successfully sent {Minutes}-minute statistics and storage data to MQTT broker", 
                     _intervalDuration.TotalMinutes);
             }
             catch (Exception ex)
@@ -103,38 +100,6 @@ namespace Systems_One_MQTT_Service
                 _logger.LogError(ex, "Failed to send statistics");
                 throw;
             }
-        }
-
-        private object CreateEnhancedStatisticsPayload(dynamic dbStats, dynamic systemHealth, IEnumerable<Models.DriveStatistics> driveStats)
-        {
-            // Convert database statistics to the expected MQTT format
-            var databaseStatistics = new[]
-            {
-                new { SensorId = "TotalItems", Value = (double)dbStats.TotalItems, Unit = "count" },
-                new { SensorId = "NoWeight", Value = (double)dbStats.NoWeight, Unit = "count" },
-                new { SensorId = "Success", Value = (double)dbStats.Success, Unit = "count" },
-                new { SensorId = "NoDimensions", Value = (double)dbStats.NoDimensions, Unit = "count" },
-                new { SensorId = "OutOfSpec", Value = (double)dbStats.OutOfSpec, Unit = "count" },
-                new { SensorId = "NotSent", Value = (double)dbStats.NotSent, Unit = "count" },
-                new { SensorId = "Sent", Value = (double)dbStats.Sent, Unit = "count" },
-                new { SensorId = "Complete", Value = (double)dbStats.Complete, Unit = "count" },
-                new { SensorId = "Valid", Value = (double)dbStats.Valid, Unit = "count" },
-                new { SensorId = "ImageSent", Value = (double)dbStats.ImageSent, Unit = "count" }
-            };
-
-            // Create drive sensor readings for Storage section
-            var storageReadings = _systemMonitoringService.CreateDriveSensorReadings(driveStats);
-
-            var epochTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-
-            return new
-            {
-                DeviceId = _deviceSerialNumber,
-                OSVersion = systemHealth.OSVersion,
-                Timestamp = epochTime,
-                Statistics = databaseStatistics,
-                Storage = storageReadings
-            };
         }
     }
 }

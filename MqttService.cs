@@ -21,8 +21,9 @@ namespace Systems_One_MQTT_Service
         private readonly MqttClientOptions _mqttClientOptions;
         private readonly MqttConfiguration _mqttConfig;
         private bool _disposed;
-        private readonly string _dataTopic;
         private readonly string _statusTopic;
+        private readonly string _statisticsTopic;
+        private readonly string _storageTopic;
         private readonly string _clientName;
         private readonly string _location;
         private readonly string _station;
@@ -43,9 +44,11 @@ namespace Systems_One_MQTT_Service
             _mqttConfig = new MqttConfiguration();
             configuration.GetSection("MQTT").Bind(_mqttConfig);
             
-            // Build topic structure - separate data and status topics
-            _dataTopic = $"{_mqttConfig.Topics.BaseTopic}/{clientName}/{location}/{station}/{_mqttConfig.Topics.DataSuffix}";
-            _statusTopic = $"{_mqttConfig.Topics.BaseTopic}/{clientName}/{location}/{station}/{_mqttConfig.Topics.StatusSuffix}";
+            // Build topic structure - separate topics for different message types
+            var basePath = $"{_mqttConfig.Topics.BaseTopic}/{clientName}/{location}/{station}";
+            _statusTopic = $"{basePath}/{_mqttConfig.Topics.StatusSuffix}";
+            _statisticsTopic = $"{basePath}/{_mqttConfig.Topics.StatisticsSuffix}";
+            _storageTopic = $"{basePath}/{_mqttConfig.Topics.StorageSuffix}";
             
             var mqttFactory = new MqttFactory();
             _mqttClient = mqttFactory.CreateMqttClient();
@@ -56,7 +59,9 @@ namespace Systems_One_MQTT_Service
             _mqttClient.DisconnectedAsync += HandleDisconnectedAsync;
             
             _logger.LogInformation("MQTT Service initialized with Device Serial Number: {SerialNumber}", _deviceSerialNumber);
-            _logger.LogInformation("Data Topic: {DataTopic}, Status Topic: {StatusTopic}", _dataTopic, _statusTopic);
+            _logger.LogInformation("Status Topic: {StatusTopic}", _statusTopic);
+            _logger.LogInformation("Statistics Topic: {StatisticsTopic}", _statisticsTopic);
+            _logger.LogInformation("Storage Topic: {StorageTopic}", _storageTopic);
         }
 
         private MqttClientOptions BuildMqttClientOptions()
@@ -94,9 +99,9 @@ namespace Systems_One_MQTT_Service
             {
                 var lastWillPayload = new
                 {
-                    DeviceId = _deviceSerialNumber,
-                    Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                    Status = "offline"
+                    device_id = _deviceSerialNumber,
+                    ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    status = "offline"
                 };
                 var lastWillJson = JsonSerializer.Serialize(lastWillPayload);
                 
@@ -181,12 +186,7 @@ namespace Systems_One_MQTT_Service
         {
             try
             {
-                var statusPayload = new
-                {
-                    DeviceId = _deviceSerialNumber,
-                    Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                    Status = status
-                };
+                var statusPayload = CreateStatusPayload(status);
                 var statusJson = JsonSerializer.Serialize(statusPayload);
                 var message = new MqttApplicationMessageBuilder()
                     .WithTopic(_statusTopic)
@@ -204,6 +204,118 @@ namespace Systems_One_MQTT_Service
         }
 
         /// <summary>
+        /// Creates a Telegraf-friendly status payload
+        /// </summary>
+        private object CreateStatusPayload(string status)
+        {
+            return new
+            {
+                device_id = _deviceSerialNumber,
+                ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                status = status,
+                os_version = Environment.OSVersion.ToString()
+            };
+        }
+
+        /// <summary>
+        /// Creates a Telegraf-friendly statistics payload
+        /// </summary>
+        public object CreateStatisticsPayload(dynamic dbStats)
+        {
+            return new
+            {
+                device_id = _deviceSerialNumber,
+                ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                statistics = new
+                {
+                    total_items = (double)dbStats.TotalItems,
+                    no_weight = (double)dbStats.NoWeight,
+                    success = (double)dbStats.Success,
+                    no_dimensions = (double)dbStats.NoDimensions,
+                    out_of_spec = (double)dbStats.OutOfSpec,
+                    not_sent = (double)dbStats.NotSent,
+                    sent = (double)dbStats.Sent,
+                    complete = (double)dbStats.Complete,
+                    valid = (double)dbStats.Valid,
+                    image_sent = (double)dbStats.ImageSent
+                }
+            };
+        }
+
+        /// <summary>
+        /// Creates a Telegraf-friendly storage payload
+        /// </summary>
+        public object CreateStoragePayload(IEnumerable<Models.DriveStatistics> driveStats)
+        {
+            var storage = new Dictionary<string, object>();
+            
+            foreach (var drive in driveStats.Where(d => d.IsReady))
+            {
+                var driveLetter = drive.DriveLetter.Replace(":", "").Replace("\\", "");
+                storage[driveLetter] = new
+                {
+                    free_gb = Math.Round(drive.FreeSpaceGB, 2),
+                    used_gb = Math.Round(drive.UsedSpaceGB, 2),
+                    total_gb = Math.Round(drive.TotalSizeGB, 2),
+                    used_pct = Math.Round(drive.PercentageUsed, 2)
+                };
+            }
+
+            return new
+            {
+                device_id = _deviceSerialNumber,
+                ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                storage = storage
+            };
+        }
+
+        /// <summary>
+        /// Sends statistics data to the MQTT broker using separate topics
+        /// </summary>
+        public async Task SendStatisticsDataAsync(dynamic dbStats, IEnumerable<Models.DriveStatistics> driveStats, CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                if (!_mqttClient.IsConnected)
+                {
+                    await ConnectAsync(cancellationToken);
+                }
+
+                if (_mqttClient.IsConnected)
+                {
+                    // Send statistics payload
+                    var statisticsPayload = CreateStatisticsPayload(dbStats);
+                    var statisticsJson = JsonSerializer.Serialize(statisticsPayload);
+                    var statisticsMessage = new MqttApplicationMessageBuilder()
+                        .WithTopic(_statisticsTopic)
+                        .WithPayload(Encoding.UTF8.GetBytes(statisticsJson))
+                        .WithQualityOfServiceLevel(ParseQualityOfService(_mqttConfig.Publishing.QualityOfService))
+                        .WithRetainFlag(_mqttConfig.Publishing.RetainMessages)
+                        .Build();
+                    await _mqttClient.PublishAsync(statisticsMessage, cancellationToken);
+                    _logger.LogInformation("Published statistics data to topic {StatisticsTopic}", _statisticsTopic);
+
+                    // Send storage payload
+                    var storagePayload = CreateStoragePayload(driveStats);
+                    var storageJson = JsonSerializer.Serialize(storagePayload);
+                    var storageMessage = new MqttApplicationMessageBuilder()
+                        .WithTopic(_storageTopic)
+                        .WithPayload(Encoding.UTF8.GetBytes(storageJson))
+                        .WithQualityOfServiceLevel(ParseQualityOfService(_mqttConfig.Publishing.QualityOfService))
+                        .WithRetainFlag(_mqttConfig.Publishing.RetainMessages)
+                        .Build();
+                    await _mqttClient.PublishAsync(storageMessage, cancellationToken);
+                    _logger.LogInformation("Published storage data to topic {StorageTopic}", _storageTopic);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error sending statistics data");
+                throw;
+            }
+        }
+
+        /// <summary>
         /// Connects to the MQTT broker and sends a sample message for testing.
         /// </summary>
         public async Task ConnectAndSendSampleMessageAsync()
@@ -211,34 +323,73 @@ namespace Systems_One_MQTT_Service
             try
             {
                 _logger.LogInformation("Starting MQTT connection test");
-                var sampleData = new
+                
+                // Create sample statistics data
+                var sampleStatsData = CreateStatisticsPayload(new 
+                { 
+                    TotalItems = 264, NoWeight = 4, Success = 249, NoDimensions = 1, 
+                    OutOfSpec = 1, NotSent = 0, Sent = 249, Complete = 249, Valid = 249, ImageSent = 200 
+                });
+                
+                // Create sample storage data using the DriveStatistics properties correctly
+                var sampleDriveStats = new List<Models.DriveStatistics>
                 {
-                    DeviceId = _deviceSerialNumber,
-                    Timestamp = GetEpochTimeMs(),
-                    Statistics = GenerateStatsReadings()
+                    new() 
+                    { 
+                        DriveLetter = "C:", 
+                        IsReady = true, 
+                        FreeSpaceBytes = (long)(156.8 * 1024 * 1024 * 1024), 
+                        UsedSpaceBytes = (long)(297.4 * 1024 * 1024 * 1024), 
+                        TotalSizeBytes = (long)(454.2 * 1024 * 1024 * 1024), 
+                        PercentageUsed = 65.5 
+                    },
+                    new() 
+                    { 
+                        DriveLetter = "E:", 
+                        IsReady = true, 
+                        FreeSpaceBytes = (long)(14.7 * 1024 * 1024 * 1024), 
+                        UsedSpaceBytes = (long)(0.14 * 1024 * 1024 * 1024), 
+                        TotalSizeBytes = (long)(14.84 * 1024 * 1024 * 1024), 
+                        PercentageUsed = 0.97 
+                    }
                 };
-                var jsonPayload = JsonSerializer.Serialize(sampleData, new JsonSerializerOptions { WriteIndented = true });
-                byte[] payloadBytes = Encoding.UTF8.GetBytes(jsonPayload);
-                _logger.LogInformation("Sample JSON message: {payload}", jsonPayload);
+                var sampleStorageData = CreateStoragePayload(sampleDriveStats);
+
+                var statisticsJson = JsonSerializer.Serialize(sampleStatsData, new JsonSerializerOptions { WriteIndented = true });
+                var storageJson = JsonSerializer.Serialize(sampleStorageData, new JsonSerializerOptions { WriteIndented = true });
+                
+                _logger.LogInformation("Sample Statistics JSON: {StatisticsPayload}", statisticsJson);
+                _logger.LogInformation("Sample Storage JSON: {StoragePayload}", storageJson);
                 _logger.LogInformation("Connection details - Host: {Host}, Username: {Username}", _mqttConfig.Broker.Host, _mqttConfig.Authentication.Username);
-                _logger.LogInformation("Publishing to data topic: {DataTopic}", _dataTopic);
-                _logger.LogInformation("Last Will configured for status topic: {StatusTopic}", _statusTopic);
+                _logger.LogInformation("Publishing to statistics topic: {StatisticsTopic}", _statisticsTopic);
+                _logger.LogInformation("Publishing to storage topic: {StorageTopic}", _storageTopic);
+
                 await ConnectAsync();
                 if (_mqttClient.IsConnected)
                 {
-                    var applicationMessage = new MqttApplicationMessageBuilder()
-                        .WithTopic(_dataTopic)
-                        .WithPayload(payloadBytes)
+                    // Send statistics message
+                    var statisticsMessage = new MqttApplicationMessageBuilder()
+                        .WithTopic(_statisticsTopic)
+                        .WithPayload(Encoding.UTF8.GetBytes(statisticsJson))
                         .WithQualityOfServiceLevel(ParseQualityOfService(_mqttConfig.Publishing.QualityOfService))
                         .WithRetainFlag(_mqttConfig.Publishing.RetainMessages)
                         .Build();
-                    _logger.LogInformation("Publishing message to data topic {DataTopic}", _dataTopic);
-                    await _mqttClient.PublishAsync(applicationMessage);
-                    _logger.LogInformation("Message published successfully");
+                    await _mqttClient.PublishAsync(statisticsMessage);
+                    _logger.LogInformation("Sample statistics message published successfully");
+
+                    // Send storage message
+                    var storageMessage = new MqttApplicationMessageBuilder()
+                        .WithTopic(_storageTopic)
+                        .WithPayload(Encoding.UTF8.GetBytes(storageJson))
+                        .WithQualityOfServiceLevel(ParseQualityOfService(_mqttConfig.Publishing.QualityOfService))
+                        .WithRetainFlag(_mqttConfig.Publishing.RetainMessages)
+                        .Build();
+                    await _mqttClient.PublishAsync(storageMessage);
+                    _logger.LogInformation("Sample storage message published successfully");
                 }
                 else
                 {
-                    _logger.LogWarning("Not connected to MQTT broker, message not sent");
+                    _logger.LogWarning("Not connected to MQTT broker, messages not sent");
                 }
             }
             catch (Exception ex)
@@ -249,10 +400,12 @@ namespace Systems_One_MQTT_Service
         }
 
         /// <summary>
-        /// Sends a custom message to the MQTT broker.
+        /// Legacy method for backward compatibility - now sends data to separate topics
         /// </summary>
         public async Task SendCustomMessageAsync(object customPayload, CancellationToken cancellationToken = default)
         {
+            _logger.LogWarning("SendCustomMessageAsync is deprecated. Use SendStatisticsDataAsync for structured data publishing.");
+            
             try
             {
                 if (!_mqttClient.IsConnected)
@@ -263,14 +416,16 @@ namespace Systems_One_MQTT_Service
                 {
                     var jsonPayload = JsonSerializer.Serialize(customPayload, new JsonSerializerOptions { WriteIndented = true });
                     byte[] payloadBytes = Encoding.UTF8.GetBytes(jsonPayload);
+                    
+                    // Send to statistics topic for backward compatibility
                     var applicationMessage = new MqttApplicationMessageBuilder()
-                        .WithTopic(_dataTopic)
+                        .WithTopic(_statisticsTopic)
                         .WithPayload(payloadBytes)
                         .WithQualityOfServiceLevel(ParseQualityOfService(_mqttConfig.Publishing.QualityOfService))
                         .WithRetainFlag(_mqttConfig.Publishing.RetainMessages)
                         .Build();
                     await _mqttClient.PublishAsync(applicationMessage, cancellationToken);
-                    _logger.LogInformation("Custom message published successfully to data topic {DataTopic}", _dataTopic);
+                    _logger.LogInformation("Custom message published successfully to statistics topic {StatisticsTopic}", _statisticsTopic);
                 }
             }
             catch (Exception ex)
@@ -313,30 +468,6 @@ namespace Systems_One_MQTT_Service
         }
 
         ~MqttService() => Dispose(false);
-
-        // Generate statistics data using the Readings format (SensorId, Value, Unit)
-        private object[] GenerateStatsReadings() => new[]
-        {
-            // Database statistics
-            new { SensorId = "TotalItems", Value = 264.0, Unit = "count" },
-            new { SensorId = "NoWeight", Value = 4.0, Unit = "count" },
-            new { SensorId = "Success", Value = 249.0, Unit = "count" },
-            new { SensorId = "NoDimensions", Value = 1.0, Unit = "count" },
-            new { SensorId = "OutOfSpec", Value = 1.0, Unit = "count" },
-            new { SensorId = "NotSent", Value = 0.0, Unit = "count" },
-            new { SensorId = "Sent", Value = 249.0, Unit = "count" },
-            new { SensorId = "GreaterThanOneItem", Value = 10.0, Unit = "count" },
-            
-            // System monitoring sample data
-            new { SensorId = "Drive_C_UsedPercentage", Value = 65.5, Unit = "percent" },
-            new { SensorId = "Drive_C_FreeSpaceGB", Value = 156.8, Unit = "GB" },
-            new { SensorId = "Drive_C_TotalSpaceGB", Value = 454.2, Unit = "GB" },
-            new { SensorId = "Drive_D_UsedPercentage", Value = 12.3, Unit = "percent" },
-            new { SensorId = "Drive_D_FreeSpaceGB", Value = 850.1, Unit = "GB" },
-            new { SensorId = "Drive_D_TotalSpaceGB", Value = 969.7, Unit = "GB" },
-            new { SensorId = "Memory_WorkingSetMB", Value = 125.6, Unit = "MB" },
-            new { SensorId = "Memory_ManagedMemoryMB", Value = 45.2, Unit = "MB" }
-        };
 
         // Get the current epoch time in milliseconds
         private static long GetEpochTimeMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();

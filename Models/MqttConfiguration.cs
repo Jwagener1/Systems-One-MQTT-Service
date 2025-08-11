@@ -42,6 +42,11 @@ namespace Systems_One_MQTT_Service.Models
     {
         public string BaseTopic { get; set; } = "systems-one";
         public string StatusSuffix { get; set; } = "status";
+        public string StatisticsSuffix { get; set; } = "statistics";
+        public string StorageSuffix { get; set; } = "storage";
+        /// <summary>
+        /// Legacy data suffix for backward compatibility
+        /// </summary>
         public string DataSuffix { get; set; } = "data";
     }
 
