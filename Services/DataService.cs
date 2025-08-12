@@ -189,7 +189,7 @@ namespace Systems_One_MQTT_Service.Services
         }
 
         /// <summary>
-        /// Get statistics for items from the last 15 minutes
+        /// Get statistics for items from the last 15 minutes using optimized single query approach
         /// </summary>
         public async Task<object> GetLast15MinutesStatisticsAsync()
         {
@@ -200,44 +200,55 @@ namespace Systems_One_MQTT_Service.Services
                 
                 using var connection = GetConnection();
                 
-                var totalItems = await connection.QuerySingleAsync<int>($"SELECT COUNT(*) FROM {_tableName} WHERE ItemDateTime >= @StartTime AND ItemDateTime <= @EndTime", new { StartTime = startTime, EndTime = endTime });
-                var noWeight = await connection.QuerySingleAsync<int>($"SELECT COUNT(*) FROM {_tableName} WHERE ItemDateTime >= @StartTime AND ItemDateTime <= @EndTime AND NoWeight = 1", new { StartTime = startTime, EndTime = endTime });
-                var noDimensions = await connection.QuerySingleAsync<int>($"SELECT COUNT(*) FROM {_tableName} WHERE ItemDateTime >= @StartTime AND ItemDateTime <= @EndTime AND NoDimension = 1", new { StartTime = startTime, EndTime = endTime });
-                var sent = await connection.QuerySingleAsync<int>($"SELECT COUNT(*) FROM {_tableName} WHERE ItemDateTime >= @StartTime AND ItemDateTime <= @EndTime AND Sent = 1", new { StartTime = startTime, EndTime = endTime });
-                var notSent = await connection.QuerySingleAsync<int>($"SELECT COUNT(*) FROM {_tableName} WHERE ItemDateTime >= @StartTime AND ItemDateTime <= @EndTime AND Sent = 0", new { StartTime = startTime, EndTime = endTime });
-                var complete = await connection.QuerySingleAsync<int>($"SELECT COUNT(*) FROM {_tableName} WHERE ItemDateTime >= @StartTime AND ItemDateTime <= @EndTime AND Complete = 1", new { StartTime = startTime, EndTime = endTime });
-                var valid = await connection.QuerySingleAsync<int>($"SELECT COUNT(*) FROM {_tableName} WHERE ItemDateTime >= @StartTime AND ItemDateTime <= @EndTime AND Valid = 1", new { StartTime = startTime, EndTime = endTime });
-                var imageSent = await connection.QuerySingleAsync<int>($"SELECT COUNT(*) FROM {_tableName} WHERE ItemDateTime >= @StartTime AND ItemDateTime <= @EndTime AND ImageSent = 1", new { StartTime = startTime, EndTime = endTime });
+                // Single optimized query to get all statistics at once, with NULL handling
+                const string statsSql = @"
+                    SELECT
+                        COUNT(*) AS TotalItems,
+                        ISNULL(SUM(CASE WHEN Weight = 0 OR Weight IS NULL THEN 1 ELSE 0 END), 0) AS NoWeight,
+                        ISNULL(SUM(CASE WHEN (Length = 0 OR Width = 0 OR Height = 0) 
+                                  OR Length IS NULL OR Width IS NULL OR Height IS NULL 
+                            THEN 1 ELSE 0 END), 0) AS NoDimensions,
+                        ISNULL(SUM(CASE WHEN Valid = 1 THEN 1 ELSE 0 END), 0) AS Success,
+                        ISNULL(SUM(CASE WHEN ItemSpec = 1 THEN 1 ELSE 0 END), 0) AS OutOfSpec,
+                        ISNULL(SUM(CASE WHEN ItemCount > 1 THEN 1 ELSE 0 END), 0) AS MoreThanOneItem,
+                        ISNULL(SUM(CASE WHEN Barcode = 'NOREAD' THEN 1 ELSE 0 END), 0) AS NoReads,
+                        ISNULL(SUM(CASE WHEN Barcode <> 'NOREAD' AND Barcode IS NOT NULL THEN 1 ELSE 0 END), 0) AS GoodReads,
+                        ISNULL(SUM(CASE WHEN Sent = 1 THEN 1 ELSE 0 END), 0) AS Sent,
+                        ISNULL(SUM(CASE WHEN Sent = 0 OR Sent IS NULL THEN 1 ELSE 0 END), 0) AS NotSent
+                    FROM dbo.ItemLog
+                    WHERE ItemDateTime >= @StartTime 
+                      AND ItemDateTime < @EndTime";
 
-                var success = complete; // Assuming success = complete items
-                var outOfSpec = totalItems - complete; // Items that are not complete are considered out of spec
+                var result = await connection.QuerySingleAsync(statsSql, new { StartTime = startTime, EndTime = endTime });
 
                 var statistics = new
                 {
-                    TotalItems = totalItems,
-                    NoWeight = noWeight,
-                    NoDimensions = noDimensions,
-                    Sent = sent,
-                    NotSent = notSent,
-                    Complete = complete,
-                    Valid = valid,
-                    Success = success,
-                    OutOfSpec = outOfSpec,
-                    ImageSent = imageSent,
+                    TotalItems = (int)result.TotalItems,
+                    NoWeight = (int)result.NoWeight,
+                    GoodReads = (int)result.GoodReads,
+                    NoReads = (int)result.NoReads,
+                    NoDimensions = (int)result.NoDimensions,
+                    Success = (int)result.Success,
+                    OutOfSpec = (int)result.OutOfSpec,
+                    MoreThanOneItem = (int)result.MoreThanOneItem,
+                    NotSent = (int)result.NotSent,
+                    Sent = (int)result.Sent,
                     TimeRange = new
                     {
                         StartTime = startTime,
-                        EndTime = endTime
+                        EndTime = endTime,
+                        DurationMinutes = (endTime - startTime).TotalMinutes
                     }
                 };
 
-                _logger.LogInformation("Retrieved 15-minute statistics from {Table}: Total={Total}, NoWeight={NoWeight}, NoDimensions={NoDimensions}, Success={Success}", 
-                    _tableName, totalItems, noWeight, noDimensions, success);
+                _logger.LogInformation("Retrieved {DurationMinutes}-minute statistics from {Table}: Total={Total}, NoWeight={NoWeight}, GoodReads={GoodReads}, NoReads={NoReads}, Success={Success}", 
+                    (endTime - startTime).TotalMinutes, _tableName, statistics.TotalItems, statistics.NoWeight, statistics.GoodReads, statistics.NoReads, statistics.Success);
+                
                 return statistics;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error retrieving 15-minute statistics from {Table}", _tableName);
+                _logger.LogError(ex, "Error retrieving statistics from {Table}", _tableName);
                 throw;
             }
         }

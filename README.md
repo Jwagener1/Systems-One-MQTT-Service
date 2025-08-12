@@ -171,8 +171,8 @@ The service now publishes data in separate, optimized streams for Telegraf inges
 {
   "device_id": "00001",
   "ts": 1754916806909,
-  "status": "online",
-  "os_version": "Microsoft Windows NT 10.0.26100.0"
+  "device_status": "online",
+  "device_os_version": "Microsoft Windows NT 10.0.26100.0"
 }
 ```
 
@@ -183,16 +183,16 @@ The service now publishes data in separate, optimized streams for Telegraf inges
   "device_id": "00001",
   "ts": 1754919514677,
   "statistics": {
-    "total_items": 7,
-    "no_weight": 1,
-    "success": 6,
+    "total_items": 264,
+    "no_weight": 4,
+    "good_reads": 249,
+    "no_reads": 15,
     "no_dimensions": 1,
+    "success": 249,
     "out_of_spec": 1,
-    "not_sent": 1,
-    "sent": 6,
-    "complete": 6,
-    "valid": 6,
-    "image_sent": 0
+    "more_than_one_item": 10,
+    "not_sent": 0,
+    "sent": 264
   }
 }
 ```
@@ -250,11 +250,11 @@ The service now publishes data in separate, optimized streams for Telegraf inges
       path = "device_id"
       
     [[inputs.mqtt_consumer.json_v2.field]]
-      path = "status"
+      path = "device_status"
       type = "string"
       
     [[inputs.mqtt_consumer.json_v2.field]]
-      path = "os_version"
+      path = "device_os_version"
       type = "string"
 ```
 
@@ -263,14 +263,14 @@ The service now publishes data in separate, optimized streams for Telegraf inges
 |-------|-------------|------|
 | `total_items` | Total items processed in interval | integer |
 | `no_weight` | Items missing weight data | integer |
-| `success` | Successfully processed items | integer |
+| `good_reads` | Items with successful barcode reads | integer |
+| `no_reads` | Items with failed barcode reads (NOREAD) | integer |
 | `no_dimensions` | Items missing dimension data | integer |
+| `success` | Successfully validated items | integer |
 | `out_of_spec` | Items outside specifications | integer |
+| `more_than_one_item` | Items with count > 1 | integer |
 | `not_sent` | Items not transmitted | integer |
 | `sent` | Successfully transmitted items | integer |
-| `complete` | Fully processed items | integer |
-| `valid` | Items passing validation | integer |
-| `image_sent` | Items with transmitted images | integer |
 
 ### Storage Metrics (Per Drive)
 | Field Pattern | Description | Type |

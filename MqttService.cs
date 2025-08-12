@@ -101,7 +101,8 @@ namespace Systems_One_MQTT_Service
                 {
                     device_id = _deviceSerialNumber,
                     ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                    status = "offline"
+                    device_status = "offline",
+                    device_os_version = Environment.OSVersion.ToString()
                 };
                 var lastWillJson = JsonSerializer.Serialize(lastWillPayload);
                 
@@ -195,7 +196,8 @@ namespace Systems_One_MQTT_Service
                     .WithRetainFlag(_mqttConfig.Publishing.RetainStatusMessages)
                     .Build();
                 await _mqttClient.PublishAsync(message, cancellationToken);
-                _logger.LogInformation("Published status message: {Status} for device {DeviceId} to topic {Topic}", status, _deviceSerialNumber, _statusTopic);
+                _logger.LogInformation("Published status message: {Status} for device {DeviceId} to topic {Topic} with retain={Retain}", 
+                    status, _deviceSerialNumber, _statusTopic, _mqttConfig.Publishing.RetainStatusMessages);
             }
             catch (Exception ex)
             {
@@ -212,8 +214,8 @@ namespace Systems_One_MQTT_Service
             {
                 device_id = _deviceSerialNumber,
                 ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                status = status,
-                os_version = Environment.OSVersion.ToString()
+                device_status = status,
+                device_os_version = Environment.OSVersion.ToString()
             };
         }
 
@@ -230,14 +232,14 @@ namespace Systems_One_MQTT_Service
                 {
                     total_items = (double)dbStats.TotalItems,
                     no_weight = (double)dbStats.NoWeight,
-                    success = (double)dbStats.Success,
+                    good_reads = (double)dbStats.GoodReads,
+                    no_reads = (double)dbStats.NoReads,
                     no_dimensions = (double)dbStats.NoDimensions,
+                    success = (double)dbStats.Success,
                     out_of_spec = (double)dbStats.OutOfSpec,
+                    more_than_one_item = (double)dbStats.MoreThanOneItem,
                     not_sent = (double)dbStats.NotSent,
-                    sent = (double)dbStats.Sent,
-                    complete = (double)dbStats.Complete,
-                    valid = (double)dbStats.Valid,
-                    image_sent = (double)dbStats.ImageSent
+                    sent = (double)dbStats.Sent
                 }
             };
         }
@@ -327,8 +329,16 @@ namespace Systems_One_MQTT_Service
                 // Create sample statistics data
                 var sampleStatsData = CreateStatisticsPayload(new 
                 { 
-                    TotalItems = 264, NoWeight = 4, Success = 249, NoDimensions = 1, 
-                    OutOfSpec = 1, NotSent = 0, Sent = 249, Complete = 249, Valid = 249, ImageSent = 200 
+                    TotalItems = 264, 
+                    NoWeight = 4, 
+                    GoodReads = 249,
+                    NoReads = 15,
+                    NoDimensions = 1, 
+                    Success = 249,
+                    OutOfSpec = 1, 
+                    MoreThanOneItem = 10,
+                    NotSent = 0, 
+                    Sent = 264
                 });
                 
                 // Create sample storage data using the DriveStatistics properties correctly
